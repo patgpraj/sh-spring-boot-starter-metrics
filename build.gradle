@@ -1,0 +1,191 @@
+buildscript {
+    repositories {
+        jcenter()
+    }
+    dependencies {
+        classpath 'org.ajoberstar:gradle-git:1.5.1'
+    }
+}
+
+apply plugin: 'application'
+apply plugin: 'distribution'
+apply plugin: 'eclipse'
+apply plugin: 'idea'
+apply plugin: 'java'
+apply plugin: 'jacoco'
+apply plugin: 'maven'
+
+def isSnapshot = true
+if (System.getenv('SNAPSHOT')?.equalsIgnoreCase('FALSE')) {
+    isSnapshot = false
+}
+
+def versionFilename = 'src/main/resources/version.properties'
+Properties properties = new Properties()
+properties.load(project.rootProject.file(versionFilename).newDataInputStream())
+def steelhouseVersion = properties.getProperty('version')
+
+// disable jar and tar default distributions
+configurations {
+    archives {
+        artifacts.remove artifacts.find { it.archiveTask.is jar }
+        artifacts.remove artifacts.find { it.archiveTask.is distTar } // distZip needed for bootRepackage
+    }
+}
+
+test {
+    reports.junitXml.destination = file('build/junit/test-results/XML')
+    reports.html.destination = file('build/junit/test-results/HTML')
+    jacoco {
+        destinationFile = file('build/jacoco/test.exec')
+        classDumpFile = file('build/jacoco/classes/dump')
+    }
+
+    // listen to events in the test execution lifecycle
+    beforeTest { descriptor ->
+        logger.lifecycle('Running test: ' + descriptor)
+    }
+}
+
+jacoco {
+    toolVersion = '0.7.7.201606060606'
+    reportsDir = file('build/jacoco')
+}
+
+jacocoTestReport {
+    group = 'Reporting'
+    description = 'Generate Jacoco test coverage reports.'
+    reports {
+        xml.enabled true
+        xml.destination 'build/jacoco/coverage.xml'
+        csv.enabled false
+        html.destination 'build/jacoco/coverage'
+    }
+}
+
+jar {
+    baseName = rootProject.name // strip version from jar name
+}
+
+artifacts {
+    archives jar
+}
+
+startScripts {
+    doLast {
+        delete windowsScript
+    }
+}
+mainClassName = 'Application'
+
+repositories {
+    jcenter()
+    maven { url "http://repo.spring.io/release" }
+    maven { url "http://repo.spring.io/milestone" }
+    maven { url "http://anvil.dal05.steelhouse.com:9001/nexus/content/repositories/thirdparty" }
+    maven { url 'http://anvil.dal05.steelhouse.com:9001/nexus/content/repositories/releases' }
+    ivy { url "http://repo001.dal05.steelhouse.com/repos/ivy" }
+}
+
+sourceCompatibility = 1.8
+targetCompatibility = 1.8
+
+configurations {
+    all {
+        exclude group: 'org.slf4j', module: 'slf4j-log4j12' // use spring boot log4j-over-slf4j
+        exclude group: 'org.mortbay.jetty', module: 'jetty' // don't need jetty6
+        exclude group: 'javax.servlet', module: 'servlet-api' // use javax.servlet:javax.servlet-api instead.
+        exclude group: 'org.mortbay.jetty', module: 'servlet-api' // use javax.servlet:javax.servlet-api instead.
+    }
+}
+
+dependencies {
+    compile 'io.prometheus:simpleclient:0.0.16'
+    compile 'io.prometheus:simpleclient_hotspot:0.0.16'
+    compile 'io.prometheus:simpleclient_servlet:0.0.16'
+    compile 'io.prometheus:simpleclient_spring_boot:0.0.16'
+    compile 'javax.inject:javax.inject:1'
+    compile 'javax.servlet:javax.servlet-api:3.1.0'
+    compile 'org.aspectj:aspectjweaver:1.8.10'
+    compile 'org.springframework:spring-context:4.3.7.RELEASE'
+    compile 'org.springframework.boot:spring-boot-actuator:1.5.2.RELEASE'
+    compile 'org.springframework.boot:spring-boot-autoconfigure:1.5.2.RELEASE'
+    compile 'org.springframework.boot:spring-boot-configuration-processor:1.5.2.RELEASE'
+}
+
+task wrapper(type: Wrapper) {
+    gradleVersion = '2.14.1'
+}
+
+def getPomVersion(String steelhouseVersion, boolean isSnapshot) {
+    return isSnapshot ? steelhouseVersion + '-' + (System.getenv('BUILD_NUMBER') ?: '0') + '-SNAPSHOT' : steelhouseVersion
+}
+
+uploadArchives {
+    repositories {
+        mavenDeployer {
+            repository(url: 'http://anvil.dal05.steelhouse.com:9001/nexus/content/repositories/releases') {
+                authentication(userName: 'jenkins', password: 'jenkinspw')
+            }
+
+            snapshotRepository(url: 'http://anvil.dal05.steelhouse.com:9001/nexus/content/repositories/snapshots') {
+                authentication(userName: 'jenkins', password: 'jenkinspw')
+            }
+            pom.version = getPomVersion(steelhouseVersion, isSnapshot)
+            pom.groupId = 'com.steelhouse'
+        }
+    }
+}
+
+// tags current version in git using steelhouseVersion
+task gitTag << {
+    def grgit = org.ajoberstar.grgit.Grgit.open(project.projectDir)
+    def tags = grgit.tag.list()
+
+    def tagName = 'v' + steelhouseVersion
+    def lastTagName = 'HEAD'
+    if (tags.size() > 0) {
+        lastTagName = tags[0].getName()
+    }
+    if (tagName != lastTagName && tags.size() > 1) {
+        lastTagName = tags[1].getName()
+    }
+    def log = grgit.log {
+        range lastTagName, 'HEAD'
+    }
+    grgit.tag.add(name: tagName, message: log, force: true)
+    grgit.push(tags: true)
+}
+
+// Writes contents of git describe --tags out to file.
+task gitVersion << {
+    def gitVersionFilename = 'src/main/resources/gitVersion.properties'
+
+    def grgit = org.ajoberstar.grgit.Grgit.open(project.projectDir)
+    def gitVersion = grgit.describe()
+    def gitVersionFile = file(gitVersionFilename)
+    gitVersionFile.write("version: " + gitVersion + "\n")
+}
+
+jar.shouldRunAfter gitVersion
+
+// increments minor version, writes to versionFilename, and commits to git.
+task incrementMinorVersion << {
+    def versionSplit = steelhouseVersion.split('\\.')
+
+    def minorVersion = Integer.parseInt(versionSplit[1])
+    def nextMinorVersion = minorVersion + 1
+    def versionFile = file(versionFilename)
+    steelhouseVersion = versionSplit[0] + "." + nextMinorVersion
+    jar.version = steelhouseVersion
+    uploadArchives.repositories.mavenDeployer.pom.version = getPomVersion(steelhouseVersion, isSnapshot)
+    versionFile.write("version: " + steelhouseVersion + "\n")
+
+    def grgit = org.ajoberstar.grgit.Grgit.open(project.projectDir)
+    grgit.add(patterns: [versionFilename], update: false)
+    grgit.commit(message: 'bump minor version [skip-ci]')
+    grgit.push()
+}
+gitTag.mustRunAfter incrementMinorVersion
+jar.mustRunAfter incrementMinorVersion
+uploadArchives.mustRunAfter incrementMinorVersion
